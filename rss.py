@@ -1,51 +1,36 @@
+import re
+import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from html import escape
-from urllib.parse import urljoin
+from urllib.parse import unquote, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from feedgen.feed import FeedGenerator
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-URL = "https://www.acerinox.com/es/comunicacion/noticias/ultimas-noticias/"
-
-MESES = {
-    "enero": 1,
-    "febrero": 2,
-    "marzo": 3,
-    "abril": 4,
-    "mayo": 5,
-    "junio": 6,
-    "julio": 7,
-    "agosto": 8,
-    "septiembre": 9,
-    "octubre": 10,
-    "noviembre": 11,
-    "diciembre": 12,
-}
+SITEMAP = "https://www.acerinox.com/sitemap.xml"
+SECCION = "https://www.acerinox.com/es/comunicacion/noticias/"
 
 
-def convertir_fecha(texto):
-    partes = texto.lower().strip().split()
+def crear_titulo(enlace):
+    ruta = unquote(urlparse(enlace).path)
+    slug = ruta.rstrip("/").split("/")[-1]
 
-    if len(partes) != 3:
-        return datetime.now(timezone.utc)
+    slug = re.sub(r"-\d{5}$", "", slug)
+    titulo = slug.replace("-", " ")
+    titulo = re.sub(r"\s+", " ", titulo).strip()
 
-    dia = int(partes[0])
-    mes = MESES[partes[1]]
-    anio = int(partes[2])
-
-    return datetime(anio, mes, dia, 8, 0, tzinfo=timezone.utc)
+    return titulo
 
 
 sesion = requests.Session()
 
 reintentos = Retry(
-    total=3,
-    connect=3,
-    read=3,
+    total=4,
+    connect=4,
+    read=4,
     backoff_factor=5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET"],
@@ -54,72 +39,82 @@ reintentos = Retry(
 sesion.mount("https://", HTTPAdapter(max_retries=reintentos))
 
 respuesta = sesion.get(
-    URL,
+    SITEMAP,
     headers={
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
         )
     },
-    timeout=120,
+    timeout=180,
 )
 
 respuesta.raise_for_status()
-soup = BeautifulSoup(respuesta.text, "html.parser")
+
+raiz = ET.fromstring(respuesta.content)
+espacio = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 noticias = []
 
-for elemento in soup.select("ul.listado > li"):
-    titulo_elemento = elemento.select_one(".titulo_elemento")
-    enlace_elemento = elemento.select_one("a.enlace_elemento")
-    fecha_elemento = elemento.select_one(".fecha_elemento span")
-    descripcion_elemento = elemento.select_one(".descripcion")
-    imagen_elemento = elemento.select_one(".imagen_elemento img")
+for elemento in raiz.findall("sm:url", espacio):
+    enlace = elemento.findtext("sm:loc", default="", namespaces=espacio)
+    ultima_modificacion = elemento.findtext(
+        "sm:lastmod",
+        default="",
+        namespaces=espacio
+    )
 
-    if not titulo_elemento or not enlace_elemento:
+    if not enlace.startswith(SECCION):
         continue
 
-    titulo = titulo_elemento.get_text(" ", strip=True)
-    enlace = urljoin(URL, enlace_elemento.get("href", ""))
-    fecha_texto = (
-        fecha_elemento.get_text(" ", strip=True)
-        if fecha_elemento
-        else ""
-    )
-    descripcion = (
-        descripcion_elemento.get_text(" ", strip=True)
-        if descripcion_elemento
-        else ""
-    )
-    imagen = (
-        urljoin(URL, imagen_elemento.get("src", ""))
-        if imagen_elemento
-        else ""
-    )
+    if not ultima_modificacion:
+        continue
+
+    if enlace.endswith("/index.html"):
+        continue
+
+    if "/ultimas-noticias/" in enlace:
+        continue
+
+    slug = urlparse(enlace).path.rstrip("/").split("/")[-1]
+
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        slug,
+        re.IGNORECASE
+    ):
+        continue
+
+    try:
+        fecha = datetime.fromisoformat(
+            ultima_modificacion.replace("Z", "+00:00")
+        )
+    except ValueError:
+        continue
 
     noticias.append({
-        "titulo": titulo,
+        "titulo": crear_titulo(enlace),
         "enlace": enlace,
-        "fecha": convertir_fecha(fecha_texto),
-        "fecha_texto": fecha_texto,
-        "descripcion": descripcion,
-        "imagen": imagen,
+        "fecha": fecha,
     })
 
 
+noticias.sort(key=lambda noticia: noticia["fecha"], reverse=True)
+noticias = noticias[:30]
+
 if not noticias:
     raise RuntimeError(
-        "No se encontraron noticias. Acerinox podría haber cambiado la página."
+        "No se encontraron noticias en el sitemap de Acerinox."
     )
 
 
 feed = FeedGenerator()
-feed.id(URL)
+feed.id(SECCION)
 feed.title("Últimas noticias de Acerinox")
 feed.description(
-    "Noticias corporativas publicadas en la web oficial de Acerinox."
+    "Nuevas noticias corporativas publicadas por Acerinox."
 )
-feed.link(href=URL, rel="alternate")
+feed.link(href=SECCION, rel="alternate")
 feed.link(href="rss.xml", rel="self")
 feed.language("es")
 feed.lastBuildDate(datetime.now(timezone.utc))
@@ -130,24 +125,11 @@ for noticia in noticias:
     entrada.title(noticia["titulo"])
     entrada.link(href=noticia["enlace"])
     entrada.pubDate(noticia["fecha"])
-
-    contenido = (
-        f'<p><b>Fecha:</b> {escape(noticia["fecha_texto"])}</p>'
-        f'<p>{escape(noticia["descripcion"])}</p>'
+    entrada.description(
+        f'<p>Noticia publicada en la web oficial de Acerinox.</p>'
+        f'<p><a href="{noticia["enlace"]}">'
+        f'Leer la noticia completa</a></p>'
     )
-
-    if noticia["imagen"]:
-        contenido += (
-            f'<p><img src="{escape(noticia["imagen"])}" '
-            f'alt="{escape(noticia["titulo"])}"></p>'
-        )
-
-    contenido += (
-        f'<p><a href="{escape(noticia["enlace"])}">'
-        f'Leer la noticia en Acerinox</a></p>'
-    )
-
-    entrada.description(contenido)
 
 feed.rss_file("rss.xml", pretty=True)
 
